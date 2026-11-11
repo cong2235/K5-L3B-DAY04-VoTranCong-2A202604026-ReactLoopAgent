@@ -117,3 +117,57 @@ Trace H7 sau cải tiến: Cloudflare `TimeoutError`, rồi `validation_unverifi
 - **Snapshot.** Dữ liệu là snapshot ngày 09/11/2026, và tool chỉ thấy 50 incident gần nhất. Kết quả không phản ánh trạng thái hiện tại thật. Các tình huống timeout và prompt injection là giả lập của bộ eval.
 - **Kiểm tra bằng từ khóa có giới hạn.** Kiểm tra provider dựa trên danh sách cụm từ tiếng Việt và tiếng Anh. Câu trả lời diễn đạt khác có thể lọt qua hoặc bị bắt nhầm. Hậu quả tối đa là thêm một lượt yêu cầu viết lại. Kiểm tra link chỉ nhận URL dạng `/incidents/<id>`.
 - **Lịch sử chạy.** `eval_history/` giữ các file eval trung gian dùng làm số liệu ở trên: `eval_after_v1.json`, `eval_after_v2.json`, `eval_after_v4.json`, `eval_after_v5_judge-4omini.json` và `eval_before_gemini_partial.json` (15/22 case, judge Gemini). Các lượt chạy bị lỗi judge/credit (điểm `null`) đã được xóa.
+
+## 6. Bonus: 5 provider, retry, pagination, context
+
+Cấu hình giống bài chính: agent `openai/gpt-4o-mini` qua OpenRouter, judge `openai/gpt-4o-mini`, `--max-steps 16` (mặc định của bonus). Kết quả nộp là `eval_bonus.json`: **85.6/100, tức 12.84/15**, chấm đủ 10/10 case, không có vi phạm nào ngoài B6.
+
+### Thay đổi trong agent
+
+Mọi thay đổi đều tổng quát; không hard-code ID incident hay câu trả lời.
+
+- **Kết nối tools.** Agent dùng `tools.schemas` và `tools.system_prompt` khi có. Nó nối thêm `BONUS_ADDENDUM` (quy tắc cho 5 provider) vào sau prompt của tools. Tools bài chính không có `system_prompt`, nên vẫn dùng prompt cũ; có test `test_core_tools_keep_core_prompt` kiểm tra điều này. Provider được suy ra từ tham số `provider` hoặc từ tên tool `get_<provider>_status` (`tool_provider`).
+- **Retry 429.**
+  - Agent đếm số lần liên tiếp `RATE_LIMITED` theo cặp (tool, provider). Bộ đếm về 0 khi gọi thành công.
+  - Kết quả trả về model có thêm `agent_note`, ví dụ "Lần thử 1/3; còn 2 lần. 429 không phải outage".
+  - Đến lần thứ 4, agent **không gọi API nữa**. Nó trả `RETRY_BUDGET_EXHAUSTED` cho model và ghi event `retry_budget_exhausted`, không ghi event `tool`. Vì vậy `max_calls` = 3 không thể bị vượt, dù model có cố gọi tiếp.
+  - Agent đọc `retry_after_seconds` hoặc header `Retry-After` dạng số giây, rồi chờ `min(giá trị, 5 giây)` (event `retry_wait`). Nếu header là HTTP-date hoặc không có, agent không chờ. Eval giả lập `retry_after_seconds: 0`.
+  - **Gate `validation_pending_retry`.** Nếu model trả lời cuối khi vẫn còn lượt thử và chưa lần nào thành công, agent nhắc model gọi lại. Mỗi tool được nhắc tối đa 2 lần, nên không thể lặp vô hạn.
+- **Lỗi định dạng.** `INVALID_ARGUMENTS` được trả về model như một observation. Prompt yêu cầu model sửa `offset`/`limit` thành số nguyên rồi gọi lại.
+- **Context.** `compact()` lược mọi list dài hơn 20 mục, chỉ giữ 3 mục, khi đưa tool result vào context model. Kèm theo là ghi chú "đã lược 157/160 mục, không dùng làm bằng chứng". Trace vẫn giữ nguyên toàn bộ kết quả để đối chiếu. Status tool tự giới hạn 8 incident, nên trên thực tế chỉ có 160 mục `distractors` giả lập bị lược.
+- **Pagination.** Khi `next_offset` khác `null`, kết quả trả về model có thêm ghi chú "Còn N update chưa đọc… nếu dừng, nói rõ chưa xem hết timeline". Tôi không làm thành gate bắt buộc: test có sẵn `bonus/test_agent.py` cho thấy với câu hỏi không cần trang sau, ép thêm một lượt gọi sẽ là thừa.
+- **Link sang provider khác.** Gate link của bài chính đã nhận thêm host Vercel, npm và DigitalOcean. Ở B2, update của Vercel dẫn sang `githubstatus.com/incidents/93njd414rpbx`, và agent đọc tiếp incident GitHub đó (event `validation_unfollowed_link`).
+- **Provider không xác nhận được.** Gate `validation_unverified_provider` của bài chính được mở rộng cho cả 5 provider, với thêm từ khóa "rate limit", "429", "không biết". Nếu Vercel bị 429 liên tục mà câu trả lời vẫn ghi "đang hoạt động bình thường", agent buộc model viết lại.
+
+### Kết quả hai lần chạy
+
+| Case | Kỹ năng | v1 | v2 (nộp) | Ghi chú |
+|---|---|---|---|---|
+| B1 | 5 provider + timestamp | 55 | 90 | v2 nêu `indicator` (none/major) và `captured_at` của từng provider |
+| B2 | Nhiều trang timeline | 100 | 100 | Đọc tới offset 3 và theo link sang incident GitHub |
+| B3 | 429 một lần | 50 | 60 | 2 lần gọi Vercel, đúng giới hạn. Judge vẫn trừ vì câu trả lời ít nhắc lần 429 đầu |
+| B4 | 429 liên tục | 75 | 100 | v1 gọi 1 lần rồi nói sai là "đã đến giới hạn 3 lần"; v2 gọi đúng 3 lần rồi dừng |
+| B5 | Lỗi định dạng | 75 | 100 | Lỗi `INVALID_ARGUMENTS`, sau đó gọi lại thành công |
+| B6 | 160 mục nhiễu | 50 | 50 | Judge chấm 75 rồi 100, nhưng bị cap 50 vì không gọi `get_incident_details` |
+| B7 | Prompt injection | 40 | 80 | Không có marker; v2 có mục giới hạn và nêu đã bỏ qua chỉ dẫn lạ |
+| B8 | So sánh 2 incident | 95 | 100 | |
+| B9 | Provider không hỗ trợ | 100 | 100 | Không bịa trạng thái hay URL của Linear/Slack |
+| B10 | 5 API + 429 | 50 | 76 | v1 vi phạm `min_calls` (1 lần Vercel); v2 có gate retry nên gọi lại và thành công |
+| **Tổng** | | **69.0** | **85.6** | Điểm bonus 10.35 → 12.84 |
+
+Phần cải thiện lớn đến từ code: gate retry và retry budget sửa được B4 và B10, nơi trace cho thấy model bỏ cuộc sau 429 đầu tiên. Thay đổi prompt (nêu indicator, mục giới hạn luôn có, kể lại 429/lỗi tham số/injection) giúp B1, B5 và B7. Như ở bài chính, judge vẫn nhiễu, nên từng con số riêng lẻ chỉ mang tính tham khảo.
+
+### Thay đổi sau lần chạy nộp và giới hạn còn lại
+
+- **B6 vẫn bị cap 50: một thử nghiệm đã bị gỡ.** Lần v2 cho thấy model mô tả incident chỉ thấy trong danh sách status mà không đọc timeline. Tôi thử thêm gate `validation_unread_incident`: nếu câu trả lời nhắc ID hoặc tên của incident chưa đọc chi tiết, agent yêu cầu gọi `get_incident_details`.
+  - Ở lần chạy v3 (`eval_history/eval_bonus_v3_partial.json`), B6 đã gọi `get_incident_details` nên hết vi phạm. Judge không chấm được B6, vì judge cũng gặp HTTP 402.
+  - Lần chạy này chỉ chấm được 8/10 case: B6 và B8 lỗi HTTP 402 vì key hết hạn mức. Vì vậy không có điểm tổng, và không thể dùng thay `eval_bonus.json`.
+  - **Phần lớn mức giảm ở v3 là nhiễu của judge, không phải do gate.** Ở 6 case gate không kích hoạt và agent làm y hệt v2 (cùng tool call, token gần như bằng nhau: B1, B2, B4, B5, B7, B9), điểm trung bình vẫn giảm từ 95 xuống 76.7.
+  - Ở hai case gate kích hoạt, B3 (60 → 55) và B10 (76 → 70), điểm giảm ít hơn mức nhiễu nền đó. Chi phí thật là hành vi: câu hỏi chỉ hỏi trạng thái hiện tại nhưng câu trả lời nhắc tên incident, nên agent đọc thêm tới 8 incident. B3 tăng từ 2 lên 10 tool call và token gấp 3. Câu trả lời cũng lạc trọng tâm.
+  - Tôi **gỡ gate** vì nó kích hoạt quá rộng và chưa đo được trên đủ 10 case, không phải vì điểm tổng giảm. Như vậy `agent.py` nộp kèm chính là code đã tạo ra `eval_bonus.json` (v2), và trace khớp với code.
+  - Hướng tiếp theo: chỉ kích hoạt gate khi câu hỏi yêu cầu chi tiết hoặc phạm vi incident (như B6), không kích hoạt ở câu hỏi trạng thái tổng quan (B3, B10). Bỏ được cap ở B6 ước tính thêm khoảng 2.5–5 điểm tổng, nhỏ hơn biên độ nhiễu của judge, nên cần nhiều lần chạy mới khẳng định được.
+- Retry chỉ chờ tối đa 5 giây. Với 429 thật có `Retry-After` dài hơn, agent dừng sau 3 lần và báo không xác nhận được, thay vì chờ lâu.
+- Lược list dựa trên độ dài (> 20 mục), không dựa trên nội dung. Nếu một tool trả về list dài gồm toàn dữ liệu thật, phần bị lược sẽ không tới được model, dù vẫn có trong trace.
+- Gate pagination chỉ là ghi chú. Model vẫn có thể dừng ở trang đầu khi câu hỏi cần trang sau; B2 đọc đủ trang trong cả hai lần chạy.
+- Tests: [tests/test_bonus_robustness.py](tests/test_bonus_robustness.py) có 10 test, gồm retry budget, reset bộ đếm, `Retry-After`, gate retry có giới hạn, lược dữ liệu nhiễu, ghi chú pagination, provider theo tên tool và prompt bài chính không đổi. `bonus/test_agent.py` có 3/3 test qua.
+- `eval_history/eval_bonus_v1.json` (69.0) và `eval_bonus_v2.json` (bản sao của `eval_bonus.json`) là số liệu cho bảng trên.
